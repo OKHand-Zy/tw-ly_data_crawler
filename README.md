@@ -25,6 +25,14 @@ ffmpeg
 ffprobe
 ```
 
+Python 套件依賴：
+
+```bash
+pip install -r requirements.txt
+```
+
+目前腳本只使用 Python 標準函式庫，所以 `requirements.txt` 不會安裝額外套件。
+
 確認 ffmpeg 是否存在：
 
 ```bash

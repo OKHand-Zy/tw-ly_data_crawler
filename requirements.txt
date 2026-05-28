@@ -1,0 +1,5 @@
+# No Python package dependencies.
+#
+# Runtime tools required outside pip:
+# - ffmpeg
+# - ffprobe
