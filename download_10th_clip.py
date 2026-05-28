@@ -333,6 +333,48 @@ def process_item(record: dict[str, Any], args: argparse.Namespace, output_dir: P
     }
 
 
+def batched(items: list[dict[str, Any]], size: int):
+    for start in range(0, len(items), size):
+        yield items[start : start + size]
+
+
+def process_entries(
+    entries: list[dict[str, Any]],
+    args: argparse.Namespace,
+    output_dir: Path,
+) -> tuple[list[dict[str, Any]], list[dict[str, str]]]:
+    rows: list[dict[str, Any]] = []
+    failures: list[dict[str, str]] = []
+    completed = 0
+    total = len(entries)
+    batch_size = max(1, args.workers) * 4
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, args.workers)) as executor:
+        for batch in batched(entries, batch_size):
+            future_to_id = {
+                executor.submit(process_item, record, args, output_dir): int(record["IVOD_ID"])
+                for record in batch
+            }
+            batch_rows: list[dict[str, Any]] = []
+
+            for future in concurrent.futures.as_completed(future_to_id):
+                ivod_id = future_to_id[future]
+                completed += 1
+                try:
+                    row = future.result()
+                    batch_rows.append(row)
+                    print(f"[{completed}/{total}] ok {ivod_id} session={row['session']}")
+                except Exception as exc:
+                    message = str(exc)
+                    failures.append({"ivod_id": str(ivod_id), "error": message})
+                    print(f"[{completed}/{total}] failed {ivod_id}: {message}", file=sys.stderr)
+
+            batch_rows.sort(key=lambda item: int(item["ivod_id"]))
+            rows.extend(batch_rows)
+
+    return rows, failures
+
+
 def write_manifest(output_dir: Path, rows: list[dict[str, Any]]) -> None:
     manifest_path = output_dir / f"第{TERM}屆" / "manifest.json"
     atomic_write_json(
@@ -353,42 +395,34 @@ def write_summary(
     rows: list[dict[str, Any]],
     failures: list[dict[str, str]],
 ) -> None:
-    missing_gazette_ids = [
-        int(row["ivod_id"])
-        for row in rows
-        if not row.get("has_gazette")
-    ]
-    missing_gazette_ids.sort()
+    missing_gazette_count = sum(1 for row in rows if not row.get("has_gazette"))
 
     summary_path = output_dir / "summury.txt"
     summary_path.parent.mkdir(parents=True, exist_ok=True)
 
-    lines = [
-        f"產生時間: {dt.datetime.now().isoformat(timespec='seconds')}",
-        f"下載範圍: 第{TERM}屆 {VIDEO_KIND}",
-        f"總共有多少個影片: {total_video_count}",
-        f"已完成 API 檢查影片數: {len(rows)}",
-        f"API 中沒有 gazette 的影片數: {len(missing_gazette_ids)}",
-        "",
-        "API 中沒有 gazette 的 IVOD_ID:",
-    ]
+    with summary_path.open("w", encoding="utf-8") as file:
+        file.write(f"產生時間: {dt.datetime.now().isoformat(timespec='seconds')}\n")
+        file.write(f"下載範圍: 第{TERM}屆 {VIDEO_KIND}\n")
+        file.write(f"總共有多少個影片: {total_video_count}\n")
+        file.write(f"已完成 API 檢查影片數: {len(rows)}\n")
+        file.write(f"API 中沒有 gazette 的影片數: {missing_gazette_count}\n")
+        file.write("\n")
+        file.write("API 中沒有 gazette 的 IVOD_ID:\n")
 
-    if missing_gazette_ids:
-        lines.extend(str(ivod_id) for ivod_id in missing_gazette_ids)
-    else:
-        lines.append("無")
+        wrote_missing = False
+        for row in rows:
+            if not row.get("has_gazette"):
+                file.write(f"{int(row['ivod_id'])}\n")
+                wrote_missing = True
+        if not wrote_missing:
+            file.write("無\n")
 
-    if failures:
-        lines.extend(
-            [
-                "",
-                f"處理失敗影片數: {len(failures)}",
-                "處理失敗 IVOD_ID:",
-            ]
-        )
-        lines.extend(f"{item['ivod_id']}: {item['error']}" for item in failures)
-
-    summary_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        if failures:
+            file.write("\n")
+            file.write(f"處理失敗影片數: {len(failures)}\n")
+            file.write("處理失敗 IVOD_ID:\n")
+            for item in failures:
+                file.write(f"{item['ivod_id']}: {item['error']}\n")
 
 
 def main() -> int:
@@ -413,29 +447,7 @@ def main() -> int:
             print(f"... {len(entries) - 20} more item(s)")
         return 0
 
-    rows: list[dict[str, Any]] = []
-    failures: list[dict[str, str]] = []
-
-    with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, args.workers)) as executor:
-        future_to_id = {
-            executor.submit(process_item, record, args, output_dir): int(record["IVOD_ID"])
-            for record in entries
-        }
-        completed = 0
-        total = len(future_to_id)
-        for future in concurrent.futures.as_completed(future_to_id):
-            ivod_id = future_to_id[future]
-            completed += 1
-            try:
-                row = future.result()
-                rows.append(row)
-                print(f"[{completed}/{total}] ok {ivod_id} session={row['session']}")
-            except Exception as exc:
-                message = str(exc)
-                failures.append({"ivod_id": str(ivod_id), "error": message})
-                print(f"[{completed}/{total}] failed {ivod_id}: {message}", file=sys.stderr)
-
-    rows.sort(key=lambda item: int(item["ivod_id"]))
+    rows, failures = process_entries(entries, args, output_dir)
     write_manifest(output_dir, rows)
     write_summary(output_dir, len(entries), rows, failures)
 
